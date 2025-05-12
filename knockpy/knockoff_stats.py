@@ -10,16 +10,23 @@ from sklearn.inspection import permutation_importance
 # Optional statistics. Implemented by Pongpisit Thanasutives
 import shap
 # import sage
+# alibi
 try:
     from alibi.explainers import PermutationImportance
     from alibi.explainers.pd_variance import PartialDependenceVariance
 except ImportError:
     print("alibi is not installed in the environment.")
+# rfpimp
 try:
     from rfpimp import importances
     import pandas as pd
 except ImportError:
     print("rfpimp (requires pandas) is not installed in the environment.")
+# eli5
+try:
+    from eli5.sklearn import PermutationImportance
+except ImportError:
+    print("eli5 is not installed in the environment.")
 
 from . import utilities
 from .constants import DEFAULT_REG_VALS
@@ -1313,6 +1320,78 @@ class AlibiPIStatistic(FeatureStatistic):
                                    verbose=False)
         pi_result = pi.explain(X=features, y=y, method='estimate', n_repeats=self.n_repeats)
         Z = np.hstack([_['mean'] for _ in pi_result.feature_importance[0]])
+
+        # Play with shape
+        Z = Z.reshape(-1)
+        if Z.shape[0] != 2 * p:
+            raise ValueError(
+                f"Unexpected shape {Z.shape} for sklearn LinearRegression coefs (expected ({2 * p},))"
+            )
+
+        # Undo random permutation
+        Z = Z[rev_inds]
+
+        # Combine with groups to create W-statistic
+        W = combine_Z_stats(Z, groups, **kwargs)
+
+        # Save
+        self.model = lm
+        self.inds = inds
+        self.rev_inds = rev_inds
+        self.Z = Z
+        self.groups = groups
+        self.W = W
+
+        # Score model
+        self.cv_score_model(
+            features=features,
+            y=y,
+            cv_score=cv_score,
+        )
+
+class Eli5PIStatistic(FeatureStatistic):
+    def __init__(self, model, n_iter=5):
+        super().__init__(model=model)
+        self.n_iter = n_iter
+
+    def fit(self, X, Xk, y, groups=None, cv_score=False, **kwargs):
+        """
+        Wraps the FeatureStatistic class with Shapley values as variable importances.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            the ``(n, p)``-shaped design matrix
+        Xk : np.ndarray
+            the ``(n, p)``-shaped matrix of knockoffs
+        y : np.ndarray
+            ``(n,)``-shaped response vector
+        groups : np.ndarray
+            For group knockoffs, a p-length array of integers from 1 to
+            num_groups such that ``groups[j] == i`` indicates that variable `j`
+            is a member of group `i`. Defaults to None (regular knockoffs).
+        cv_score : bool
+            If true, score the feature statistic's predictive accuracy
+            using cross validation.
+        kwargs : dict
+            Extra kwargs to pass to ``combine_Z_stats``.
+
+        Returns
+        -------
+        W : np.ndarray
+            an array of feature statistics. This is ``(p,)``-dimensional
+            for regular knockoffs and ``(num_groups,)``-dimensional for
+            group knockoffs.
+        """
+
+        # Run linear regression, permute indexes to prevent FDR violations
+        p = X.shape[1]
+        features = np.concatenate([X, Xk], axis=1)
+        inds, rev_inds = utilities.random_permutation_inds(2 * p)
+        features = features[:, inds]
+
+        lm = self.model.fit(features, y)
+        Z = PermutationImportance(lm, n_iter=self.n_iter).fit(features, y).feature_importances_
 
         # Play with shape
         Z = Z.reshape(-1)
