@@ -5,6 +5,21 @@ import numpy as np
 # Model-fitters
 import sklearn
 from sklearn import ensemble, linear_model, model_selection
+from sklearn.inspection import permutation_importance
+
+# Optional statistics. Implemented by Pongpisit Thanasutives
+import shap
+# import sage
+try:
+    from alibi.explainers import PermutationImportance
+    from alibi.explainers.pd_variance import PartialDependenceVariance
+except ImportError:
+    print("alibi is not installed in the environment.")
+try:
+    from rfpimp import importances
+    import pandas as pd
+except ImportError:
+    print("rfpimp (requires pandas) is not installed in the environment.")
 
 from . import utilities
 from .constants import DEFAULT_REG_VALS
@@ -1096,6 +1111,380 @@ class OLSStatistic(FeatureStatistic):
 
         return W
 
+class PIMPStatistic(FeatureStatistic):
+    def __init__(self, model, feature_names):
+        super().__init__(model=model)
+        self.feature_names = list(feature_names)
+        # ko: knockoff
+        self.feature_names = self.feature_names + ['ko_'+_ for _ in self.feature_names]
+
+    def fit(self, X, Xk, y, groups=None, cv_score=False, **kwargs):
+        """
+        Wraps the FeatureStatistic class with Shapley values as variable importances.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            the ``(n, p)``-shaped design matrix
+        Xk : np.ndarray
+            the ``(n, p)``-shaped matrix of knockoffs
+        y : np.ndarray
+            ``(n,)``-shaped response vector
+        groups : np.ndarray
+            For group knockoffs, a p-length array of integers from 1 to
+            num_groups such that ``groups[j] == i`` indicates that variable `j`
+            is a member of group `i`. Defaults to None (regular knockoffs).
+        cv_score : bool
+            If true, score the feature statistic's predictive accuracy
+            using cross validation.
+        kwargs : dict
+            Extra kwargs to pass to ``combine_Z_stats``.
+
+        Returns
+        -------
+        W : np.ndarray
+            an array of feature statistics. This is ``(p,)``-dimensional
+            for regular knockoffs and ``(num_groups,)``-dimensional for
+            group knockoffs.
+        """
+
+        # Run linear regression, permute indexes to prevent FDR violations
+        p = X.shape[1]
+        features = np.concatenate([X, Xk], axis=1)
+        inds, rev_inds = utilities.random_permutation_inds(2 * p)
+        features = features[:, inds]
+
+        df_features = pd.DataFrame(features, columns=self.feature_names)
+        lm = self.model.fit(df_features, y)
+        Z = importances(lm, df_features, y_valid=pd.Series(y), sort=False).values.ravel()
+
+        # Play with shape
+        Z = Z.reshape(-1)
+        if Z.shape[0] != 2 * p:
+            raise ValueError(
+                f"Unexpected shape {Z.shape} for sklearn LinearRegression coefs (expected ({2 * p},))"
+            )
+
+        # Undo random permutation
+        Z = Z[rev_inds]
+
+        # Combine with groups to create W-statistic
+        W = combine_Z_stats(Z, groups, **kwargs)
+
+        # Save
+        self.model = lm
+        self.inds = inds
+        self.rev_inds = rev_inds
+        self.Z = Z
+        self.groups = groups
+        self.W = W
+
+        # Score model
+        self.cv_score_model(
+            features=features,
+            y=y,
+            cv_score=cv_score,
+        )
+
+class AlibiPDStatistic(FeatureStatistic):
+    def __init__(self, model, grid_resolution=100, feature_names=None):
+        super().__init__(model=model)
+        self.grid_resolution = grid_resolution
+        self.feature_names = feature_names
+
+    def fit(self, X, Xk, y, groups=None, cv_score=False, **kwargs):
+        """
+        Wraps the FeatureStatistic class with Shapley values as variable importances.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            the ``(n, p)``-shaped design matrix
+        Xk : np.ndarray
+            the ``(n, p)``-shaped matrix of knockoffs
+        y : np.ndarray
+            ``(n,)``-shaped response vector
+        groups : np.ndarray
+            For group knockoffs, a p-length array of integers from 1 to
+            num_groups such that ``groups[j] == i`` indicates that variable `j`
+            is a member of group `i`. Defaults to None (regular knockoffs).
+        cv_score : bool
+            If true, score the feature statistic's predictive accuracy
+            using cross validation.
+        kwargs : dict
+            Extra kwargs to pass to ``combine_Z_stats``.
+
+        Returns
+        -------
+        W : np.ndarray
+            an array of feature statistics. This is ``(p,)``-dimensional
+            for regular knockoffs and ``(num_groups,)``-dimensional for
+            group knockoffs.
+        """
+
+        # Run linear regression, permute indexes to prevent FDR violations
+        p = X.shape[1]
+        features = np.concatenate([X, Xk], axis=1)
+        inds, rev_inds = utilities.random_permutation_inds(2 * p)
+        features = features[:, inds]
+
+        lm = self.model.fit(features, y)
+        predict_fn = lm.predict
+        pd = PartialDependenceVariance(predictor=predict_fn,
+                                       feature_names=self.feature_names,
+                                       verbose=False)
+        Z = pd.explain(X=features, method='importance', grid_resolution=self.grid_resolution).feature_importance[0]
+
+        # Play with shape
+        Z = Z.reshape(-1)
+        if Z.shape[0] != 2 * p:
+            raise ValueError(
+                f"Unexpected shape {Z.shape} for sklearn LinearRegression coefs (expected ({2 * p},))"
+            )
+
+        # Undo random permutation
+        Z = Z[rev_inds]
+
+        # Combine with groups to create W-statistic
+        W = combine_Z_stats(Z, groups, **kwargs)
+
+        # Save
+        self.model = lm
+        self.inds = inds
+        self.rev_inds = rev_inds
+        self.Z = Z
+        self.groups = groups
+        self.W = W
+
+        # Score model
+        self.cv_score_model(
+            features=features,
+            y=y,
+            cv_score=cv_score,
+        )
+
+class AlibiPIStatistic(FeatureStatistic):
+    def __init__(self, model, n_repeats=50, feature_names=None):
+        super().__init__(model=model)
+        self.n_repeats = n_repeats
+        self.feature_names = feature_names
+
+    def fit(self, X, Xk, y, groups=None, cv_score=False, **kwargs):
+        """
+        Wraps the FeatureStatistic class with Shapley values as variable importances.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            the ``(n, p)``-shaped design matrix
+        Xk : np.ndarray
+            the ``(n, p)``-shaped matrix of knockoffs
+        y : np.ndarray
+            ``(n,)``-shaped response vector
+        groups : np.ndarray
+            For group knockoffs, a p-length array of integers from 1 to
+            num_groups such that ``groups[j] == i`` indicates that variable `j`
+            is a member of group `i`. Defaults to None (regular knockoffs).
+        cv_score : bool
+            If true, score the feature statistic's predictive accuracy
+            using cross validation.
+        kwargs : dict
+            Extra kwargs to pass to ``combine_Z_stats``.
+
+        Returns
+        -------
+        W : np.ndarray
+            an array of feature statistics. This is ``(p,)``-dimensional
+            for regular knockoffs and ``(num_groups,)``-dimensional for
+            group knockoffs.
+        """
+
+        # Run linear regression, permute indexes to prevent FDR violations
+        p = X.shape[1]
+        features = np.concatenate([X, Xk], axis=1)
+        inds, rev_inds = utilities.random_permutation_inds(2 * p)
+        features = features[:, inds]
+
+        lm = self.model.fit(features, y)
+        predict_fn = lm.predict
+        pi = PermutationImportance(predictor=predict_fn,
+                                   loss_fns=['mean_squared_error'],
+                                   feature_names=self.feature_names,
+                                   verbose=False)
+        pi_result = pi.explain(X=features, y=y, method='estimate', n_repeats=self.n_repeats)
+        Z = np.hstack([_['mean'] for _ in pi_result.feature_importance[0]])
+
+        # Play with shape
+        Z = Z.reshape(-1)
+        if Z.shape[0] != 2 * p:
+            raise ValueError(
+                f"Unexpected shape {Z.shape} for sklearn LinearRegression coefs (expected ({2 * p},))"
+            )
+
+        # Undo random permutation
+        Z = Z[rev_inds]
+
+        # Combine with groups to create W-statistic
+        W = combine_Z_stats(Z, groups, **kwargs)
+
+        # Save
+        self.model = lm
+        self.inds = inds
+        self.rev_inds = rev_inds
+        self.Z = Z
+        self.groups = groups
+        self.W = W
+
+        # Score model
+        self.cv_score_model(
+            features=features,
+            y=y,
+            cv_score=cv_score,
+        )
+
+class PIStatistic(FeatureStatistic):
+    def __init__(self, model, n_repeats=30):
+        super().__init__(model=model)
+        self.n_repeats = n_repeats
+
+    def fit(self, X, Xk, y, groups=None, cv_score=False, **kwargs):
+        """
+        Wraps the FeatureStatistic class with Shapley values as variable importances.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            the ``(n, p)``-shaped design matrix
+        Xk : np.ndarray
+            the ``(n, p)``-shaped matrix of knockoffs
+        y : np.ndarray
+            ``(n,)``-shaped response vector
+        groups : np.ndarray
+            For group knockoffs, a p-length array of integers from 1 to
+            num_groups such that ``groups[j] == i`` indicates that variable `j`
+            is a member of group `i`. Defaults to None (regular knockoffs).
+        cv_score : bool
+            If true, score the feature statistic's predictive accuracy
+            using cross validation.
+        kwargs : dict
+            Extra kwargs to pass to ``combine_Z_stats``.
+
+        Returns
+        -------
+        W : np.ndarray
+            an array of feature statistics. This is ``(p,)``-dimensional
+            for regular knockoffs and ``(num_groups,)``-dimensional for
+            group knockoffs.
+        """
+
+        # Run linear regression, permute indexes to prevent FDR violations
+        p = X.shape[1]
+        features = np.concatenate([X, Xk], axis=1)
+        inds, rev_inds = utilities.random_permutation_inds(2 * p)
+        features = features[:, inds]
+
+        lm = self.model.fit(features, y)
+        Z = permutation_importance(lm, features, y, n_repeats=self.n_repeats)['importances_mean']
+
+        # Play with shape
+        Z = Z.reshape(-1)
+        if Z.shape[0] != 2 * p:
+            raise ValueError(
+                f"Unexpected shape {Z.shape} for sklearn LinearRegression coefs (expected ({2 * p},))"
+            )
+
+        # Undo random permutation
+        Z = Z[rev_inds]
+
+        # Combine with groups to create W-statistic
+        W = combine_Z_stats(Z, groups, **kwargs)
+
+        # Save
+        self.model = lm
+        self.inds = inds
+        self.rev_inds = rev_inds
+        self.Z = Z
+        self.groups = groups
+        self.W = W
+
+        # Score model
+        self.cv_score_model(
+            features=features,
+            y=y,
+            cv_score=cv_score,
+        )
+
+class ShapStatistic(FeatureStatistic):
+    def __init__(self, model):
+        super().__init__(model=model)
+
+    def fit(self, X, Xk, y, groups=None, cv_score=False, **kwargs):
+        """
+        Wraps the FeatureStatistic class with Shapley values as variable importances.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            the ``(n, p)``-shaped design matrix
+        Xk : np.ndarray
+            the ``(n, p)``-shaped matrix of knockoffs
+        y : np.ndarray
+            ``(n,)``-shaped response vector
+        groups : np.ndarray
+            For group knockoffs, a p-length array of integers from 1 to
+            num_groups such that ``groups[j] == i`` indicates that variable `j`
+            is a member of group `i`. Defaults to None (regular knockoffs).
+        cv_score : bool
+            If true, score the feature statistic's predictive accuracy
+            using cross validation.
+        kwargs : dict
+            Extra kwargs to pass to ``combine_Z_stats``.
+
+        Returns
+        -------
+        W : np.ndarray
+            an array of feature statistics. This is ``(p,)``-dimensional
+            for regular knockoffs and ``(num_groups,)``-dimensional for
+            group knockoffs.
+        """
+
+        # Run linear regression, permute indexes to prevent FDR violations
+        p = X.shape[1]
+        features = np.concatenate([X, Xk], axis=1)
+        inds, rev_inds = utilities.random_permutation_inds(2 * p)
+        features = features[:, inds]
+
+        lm = self.model.fit(features, y)
+        explainer = shap.explainers.Linear(lm, features)
+        Z = abs(explainer(features).values).mean(axis=0)
+
+        # Play with shape
+        Z = Z.reshape(-1)
+        if Z.shape[0] != 2 * p:
+            raise ValueError(
+                f"Unexpected shape {Z.shape} for sklearn LinearRegression coefs (expected ({2 * p},))"
+            )
+
+        # Undo random permutation
+        Z = Z[rev_inds]
+
+        # Combine with groups to create W-statistic
+        W = combine_Z_stats(Z, groups, **kwargs)
+
+        # Save
+        self.model = lm
+        self.inds = inds
+        self.rev_inds = rev_inds
+        self.Z = Z
+        self.groups = groups
+        self.W = W
+
+        # Score model
+        self.cv_score_model(
+            features=features,
+            y=y,
+            cv_score=cv_score,
+        )
 
 class RandomForestStatistic(FeatureStatistic):
     def fit(
@@ -1364,7 +1753,7 @@ def data_dependent_threshhold(W, fdr=0.10, offset=1):
     if len(W.shape) == 1:
         # sort by abs values
         absW = np.abs(W)
-        inds = np.argsort(-absW, stable="stable")
+        inds = np.argsort(-absW) 
         negatives = np.cumsum(W[inds] <= 0)
         positives = np.cumsum(W[inds] > 0)
         positives[positives == 0] = 1  # Don't divide by 0
